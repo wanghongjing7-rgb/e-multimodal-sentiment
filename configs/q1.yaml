@@ -1,0 +1,5 @@
+task: q1
+q1:
+  extraction_backend: null
+  alignment_method: null
+  allow_model_download: false

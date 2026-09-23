@@ -1,0 +1,6 @@
+# Copy to configs/local.yaml and fill values for this machine only.
+device: null
+paths:
+  data_root: null
+  output_root: null
+  checkpoint_root: null

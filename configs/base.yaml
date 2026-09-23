@@ -1,0 +1,13 @@
+seed: 42
+data:
+  batch_size: 8
+  num_workers: 0
+  class_mapping: null  # Competition thresholds and encoding await confirmation.
+model:
+  name: smoke_test
+  input_dims: null  # Set only after auditing real features.
+  hidden_dim: 8
+training:
+  learning_rate: 0.001
+evaluation:
+  f1_averages: [macro, weighted]  # 最终正式口径待确认

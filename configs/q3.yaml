@@ -1,0 +1,5 @@
+task: q3
+q3:
+  attribution_method: null
+  evidence_mapping: null
+  require_complete_modalities: true

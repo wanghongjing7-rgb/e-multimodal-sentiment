@@ -1,0 +1,11 @@
+task: q2
+missingness:
+  kind: contiguous_interval
+  unit: null
+  position: null
+  duration: null
+  modalities:
+    - text
+  seed: 42
+robust_model:
+  name: null
