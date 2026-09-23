@@ -1,1 +1,5 @@
-"""Future formal backbones; intentionally empty until routing experiments."""
+"""Project-owned wrappers around candidate backbones."""
+
+from .mmsa_multitask import MMSAMulTMultiTask
+
+__all__ = ["MMSAMulTMultiTask"]

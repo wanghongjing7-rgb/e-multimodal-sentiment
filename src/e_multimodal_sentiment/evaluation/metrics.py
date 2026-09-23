@@ -32,6 +32,8 @@ def compute_metrics(
         # 最终正式口径待确认：同时报告 macro 和 weighted；固定三类，zero_division=0。
         result["macro_f1"] = sum(f1s) / 3
         result["weighted_f1"] = sum(f * n for f, n in zip(f1s, supports)) / len(labels)
+        result["f1_macro"] = result["macro_f1"]
+        result["f1_weighted"] = result["weighted_f1"]
     if (regression is None) != (reg_labels is None):
         raise ValueError("Regression predictions and labels must be paired.")
     if regression is not None and reg_labels is not None:
