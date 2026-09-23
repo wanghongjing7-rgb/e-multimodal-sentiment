@@ -15,6 +15,8 @@ class ModelOutput:
     text_hidden: torch.Tensor | None = None
     audio_hidden: torch.Tensor | None = None
     vision_hidden: torch.Tensor | None = None
+    fused_hidden: torch.Tensor | None = None
+    modality_hidden: dict[str, torch.Tensor] | None = None
     fusion_weights: torch.Tensor | None = None
     temporal_scores: dict[str, torch.Tensor] | None = None
     auxiliary: dict[str, torch.Tensor] = field(default_factory=dict)

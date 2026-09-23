@@ -20,6 +20,7 @@ if str(PROJECT_SRC) not in sys.path:
 from e_multimodal_sentiment.data.adapters import Attachment2AlignedAdapter
 from e_multimodal_sentiment.data.collate import collate_samples
 from e_multimodal_sentiment.integrations.mmsa import batch_to_mmsa_mult_inputs
+from e_multimodal_sentiment.models.backbones import MMSAMulTMultiTask
 
 MMSA_COMMIT = "a94e65d07fa1ae0d44e552390074b29b0898edfd"
 
@@ -30,6 +31,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=("train", "valid", "test"), default="test")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--mmsa-root", type=Path, required=True)
+    parser.add_argument("--multitask", action="store_true")
     return parser.parse_args()
 
 
@@ -90,19 +92,26 @@ def main() -> None:
 
     mult_class = _load_mult_class(args.mmsa_root)
     model = mult_class(_mult_args(args.mmsa_root))
+    if args.multitask:
+        model = MMSAMulTMultiTask(model)
     model.eval()
     started = time.perf_counter()
     with torch.no_grad():
         output = model(inputs.text, inputs.audio, inputs.video)
     elapsed = time.perf_counter() - started
 
-    prediction = output["M"]
     print(f"text shape: {tuple(inputs.text.shape)}")
     print(f"audio shape: {tuple(inputs.audio.shape)}")
     print(f"video shape: {tuple(inputs.video.shape)}")
     print(f"output type: {type(output).__name__}")
-    print(f"output shape: {tuple(prediction.shape)}")
-    print(f"output dtype: {prediction.dtype}")
+    if args.multitask:
+        print(f"class_logits shape: {tuple(output.class_logits.shape)}")
+        print(f"regression shape: {tuple(output.regression.shape)}")
+        print(f"fused_hidden shape: {tuple(output.fused_hidden.shape)}")
+    else:
+        prediction = output["M"]
+        print(f"output shape: {tuple(prediction.shape)}")
+        print(f"output dtype: {prediction.dtype}")
     print(f"forward elapsed time: {elapsed:.6f} s")
 
 
