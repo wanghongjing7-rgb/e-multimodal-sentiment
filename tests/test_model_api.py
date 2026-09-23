@@ -20,13 +20,21 @@ from e_multimodal_sentiment.training.trainer import Trainer
 
 
 def make_batch(labeled: bool = True) -> dict[str, Any]:
+    def sequence(length: int, dim: int) -> ModalitySequence:
+        return ModalitySequence(
+            torch.ones(length, dim),
+            valid_mask=torch.ones(length, dtype=torch.bool),
+            observed_mask=torch.ones(length, dtype=torch.bool),
+            missing_mask=torch.zeros(length, dtype=torch.bool),
+        )
+
     sample = SampleSchema(
         "synthetic",
-        ModalitySequence(torch.ones(4, 2)),
-        ModalitySequence(torch.ones(7, 3)),
-        ModalitySequence(torch.ones(10, 4)),
-        class_label=1 if labeled else None,
-        reg_label=0.2 if labeled else None,
+        sequence(4, 2),
+        sequence(7, 3),
+        sequence(10, 4),
+        classification_label=1 if labeled else None,
+        regression_label=0.2 if labeled else None,
     )
     return collate_samples([sample])
 

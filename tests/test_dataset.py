@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from e_multimodal_sentiment.common.schema import ModalitySequence, SampleSchema
+from e_multimodal_sentiment.common.schema import BatchSchema, ModalitySequence, SampleSchema
 from e_multimodal_sentiment.data.adapters import MoseiPickleAdapter
 from e_multimodal_sentiment.data.collate import collate_samples
 from e_multimodal_sentiment.data.dataset import MultimodalDataset
@@ -14,7 +14,13 @@ from scripts.audit_data import audit_pickle
 
 
 def sequence(length: int, dim: int, *, valid: torch.Tensor | None = None) -> ModalitySequence:
-    return ModalitySequence(torch.ones(length, dim), valid_mask=valid)
+    valid = valid if valid is not None else torch.ones(length, dtype=torch.bool)
+    return ModalitySequence(
+        torch.ones(length, dim),
+        valid_mask=valid,
+        observed_mask=torch.ones(length, dtype=torch.bool),
+        missing_mask=torch.zeros(length, dtype=torch.bool),
+    )
 
 
 def sample(lengths: tuple[int, int, int], labeled: bool = True, sample_id: str = "sample") -> SampleSchema:
@@ -23,8 +29,8 @@ def sample(lengths: tuple[int, int, int], labeled: bool = True, sample_id: str =
         sequence(lengths[0], 2),
         sequence(lengths[1], 3),
         sequence(lengths[2], 4),
-        class_label=1 if labeled else None,
-        reg_label=0.5 if labeled else None,
+        classification_label=1 if labeled else None,
+        regression_label=0.5 if labeled else None,
     )
 
 
@@ -35,15 +41,39 @@ def test_aligned_and_unaligned_schema() -> None:
     assert (unaligned.text.length, unaligned.audio.length, unaligned.vision.length) == (4, 7, 10)
 
 
-def test_modality_sequence_validation() -> None:
-    with pytest.raises(ValueError, match="shape"):
-        ModalitySequence(torch.ones(3, 2), valid_mask=torch.ones(2, dtype=torch.bool))
-    with pytest.raises(ValueError, match="invalid"):
-        ModalitySequence(
-            torch.ones(3, 2),
-            valid_mask=torch.tensor([True, False, True]),
-            missing_mask=torch.tensor([False, True, False]),
-        )
+def test_available_mask_semantics() -> None:
+    sequence = ModalitySequence(
+        torch.ones(5, 8),
+        valid_mask=torch.tensor([True, True, True, False, True]),
+        observed_mask=torch.tensor([True, False, True, False, True]),
+        missing_mask=torch.tensor([False, False, True, False, False]),
+    )
+    expected = sequence.valid_mask & sequence.observed_mask & ~sequence.missing_mask
+    assert torch.equal(sequence.available_mask, expected)
+
+
+def test_internal_zero_does_not_change_masks() -> None:
+    features = torch.ones(5, 8)
+    features[2] = 0
+    sequence = ModalitySequence(
+        features,
+        valid_mask=torch.ones(5, dtype=torch.bool),
+        observed_mask=torch.ones(5, dtype=torch.bool),
+        missing_mask=torch.zeros(5, dtype=torch.bool),
+    )
+    assert sequence.valid_mask[2]
+    assert sequence.observed_mask[2]
+    assert not sequence.missing_mask[2]
+
+
+def test_batch_modality_sequence() -> None:
+    sequence = ModalitySequence(
+        torch.ones(2, 5, 8),
+        valid_mask=torch.ones(2, 5, dtype=torch.bool),
+        observed_mask=torch.ones(2, 5, dtype=torch.bool),
+        missing_mask=torch.zeros(2, 5, dtype=torch.bool),
+    )
+    assert sequence.available_mask.shape == (2, 5)
 
 
 def test_collate_independent_axes_and_padding() -> None:
@@ -51,6 +81,7 @@ def test_collate_independent_axes_and_padding() -> None:
     second = sample((2, 3, 5), sample_id="short")
     loader = DataLoader(MultimodalDataset([first, second]), batch_size=2, collate_fn=collate_samples)
     batch = next(iter(loader))
+    assert isinstance(batch, BatchSchema)
     assert batch["text"].shape == (2, 4, 2)
     assert batch["audio"].shape == (2, 7, 3)
     assert batch["vision"].shape == (2, 10, 4)
@@ -58,8 +89,10 @@ def test_collate_independent_axes_and_padding() -> None:
     assert batch["valid_masks"]["audio"].shape == (2, 7)
     assert batch["valid_masks"]["vision"].shape == (2, 10)
     assert batch["missing_masks"]["text"].shape == (2, 4)
+    assert batch["observed_masks"]["text"].shape == (2, 4)
     assert not batch["valid_masks"]["text"][1, 2:].any()
     assert not batch["missing_masks"]["text"][1, 2:].any()
+    assert not batch["observed_masks"]["text"][1, 2:].any()
 
 
 def test_unlabeled_batch_uses_none_labels() -> None:

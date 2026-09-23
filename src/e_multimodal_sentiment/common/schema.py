@@ -1,87 +1,173 @@
-"""Shared contracts for aligned and unaligned multimodal samples."""
-from dataclasses import dataclass, field
-from typing import Any
+"""Frozen common data contracts and mask semantics."""
+from dataclasses import dataclass
 
 import torch
 
 MODALITIES = ("text", "audio", "vision")
+TEXT_REPRESENTATIONS = ("dense", "bert_tokens")
 
 
 @dataclass
 class ModalitySequence:
-    """One modality on its native time axis.
+    """One modality sequence for a sample or padded batch.
 
-    valid_mask identifies real rather than padded positions.
-    missing_mask identifies unavailable data at otherwise valid positions.
+    valid_mask marks structural validity, chiefly batch padding.
+    observed_mask marks whether the source contains a modality observation.
+    missing_mask marks only missingness introduced or identified for Q2.
+    No mask is inferred from feature values.
     """
 
     features: torch.Tensor
-    valid_mask: torch.Tensor | None = None
-    missing_mask: torch.Tensor | None = None
+    valid_mask: torch.Tensor
+    observed_mask: torch.Tensor
+    missing_mask: torch.Tensor
 
     def __post_init__(self) -> None:
-        if not isinstance(self.features, torch.Tensor) or self.features.ndim != 2:
-            raise ValueError("features must be a torch.Tensor with shape [T_m, D_m].")
-        if not self.features.is_floating_point():
-            raise ValueError("features must use a floating-point dtype.")
-        if self.features.shape[0] < 1 or self.features.shape[1] < 1:
-            raise ValueError("features must have non-zero time and feature dimensions.")
-        for name, mask in (("valid_mask", self.valid_mask), ("missing_mask", self.missing_mask)):
-            if mask is None:
-                continue
-            if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool:
-                raise ValueError(f"{name} must be a boolean torch.Tensor or None.")
-            if mask.shape != (self.length,):
-                raise ValueError(f"{name} must have shape [{self.length}], got {tuple(mask.shape)}.")
+        if not isinstance(self.features, torch.Tensor):
+            raise TypeError("features must be a torch.Tensor.")
+        if self.features.ndim not in (2, 3):
+            raise ValueError("features must have shape [T,D] or [B,T,D].")
+        expected_shape = self.features.shape[:-1]
+        for name in ("valid_mask", "observed_mask", "missing_mask"):
+            mask = getattr(self, name)
+            if not isinstance(mask, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor.")
+            if mask.ndim != self.features.ndim - 1 or mask.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {tuple(expected_shape)} for features "
+                    f"with shape {tuple(self.features.shape)}."
+                )
             if mask.device != self.features.device:
                 raise ValueError(f"{name} and features must be on the same device.")
-        if self.missing_mask is not None:
-            valid = self.valid_mask if self.valid_mask is not None else torch.ones_like(self.missing_mask)
-            if torch.any(self.missing_mask & ~valid):
-                raise ValueError("missing_mask cannot mark invalid or padded positions as missing.")
+            if mask.dtype != torch.bool:
+                setattr(self, name, mask.to(dtype=torch.bool))
+
+    @property
+    def available_mask(self) -> torch.Tensor:
+        """Positions available to downstream computation."""
+        return self.valid_mask & self.observed_mask & ~self.missing_mask
 
     @property
     def length(self) -> int:
-        """Return the native temporal length T_m."""
-        return self.features.shape[0]
+        """Temporal length T for either [T,D] or [B,T,D] features."""
+        return self.features.shape[-2]
 
 
 @dataclass
 class SampleSchema:
-    """A sample whose three modalities may use independent time axes."""
+    """One aligned or unaligned multimodal sample."""
 
-    id: str
+    sample_id: str
     text: ModalitySequence
     audio: ModalitySequence
     vision: ModalitySequence
-    class_label: torch.Tensor | int | None = None
-    reg_label: torch.Tensor | float | None = None
-    raw_text: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    text_representation: str = "dense"
+    classification_label: int | None = None
+    regression_label: float | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.id, str) or not self.id:
-            raise ValueError("id must be a non-empty string.")
+        if not isinstance(self.sample_id, str) or not self.sample_id:
+            raise ValueError("sample_id must be a non-empty string.")
         for name in MODALITIES:
-            if not isinstance(getattr(self, name), ModalitySequence):
-                raise ValueError(f"{name} must be a ModalitySequence.")
-        self._validate_scalar_label("class_label", self.class_label)
-        self._validate_scalar_label("reg_label", self.reg_label)
-        if isinstance(self.class_label, torch.Tensor) and self.class_label.is_floating_point():
-            raise ValueError("class_label tensor must use an integer dtype.")
-        class_value = self.class_label.item() if isinstance(self.class_label, torch.Tensor) else self.class_label
-        if class_value is not None and int(class_value) not in (0, 1, 2):
-            raise ValueError("class_label must be 0, 1, 2, or None; formal mapping awaits audit.")
-        reg_value = self.reg_label.item() if isinstance(self.reg_label, torch.Tensor) else self.reg_label
-        if reg_value is not None and not torch.isfinite(torch.tensor(float(reg_value))):
-            raise ValueError("reg_label must be finite or None.")
-
-    @staticmethod
-    def _validate_scalar_label(name: str, value: torch.Tensor | int | float | None) -> None:
-        if isinstance(value, torch.Tensor) and value.numel() != 1:
-            raise ValueError(f"{name} tensor must contain exactly one value.")
+            sequence = getattr(self, name)
+            if not isinstance(sequence, ModalitySequence):
+                raise TypeError(f"{name} must be a ModalitySequence.")
+            if sequence.features.ndim != 2:
+                raise ValueError(f"{name} in SampleSchema must contain [T,D] features.")
+        if self.text_representation not in TEXT_REPRESENTATIONS:
+            raise ValueError(
+                f"text_representation must be one of {TEXT_REPRESENTATIONS}, "
+                f"got {self.text_representation!r}."
+            )
 
     @property
     def is_aligned(self) -> bool:
-        """Whether native temporal lengths happen to be equal."""
+        """Whether the three native temporal lengths are equal."""
         return self.text.length == self.audio.length == self.vision.length
+
+    @property
+    def id(self) -> str:
+        """Compatibility alias for the previous field name."""
+        return self.sample_id
+
+    @property
+    def class_label(self) -> int | None:
+        """Compatibility alias for the previous field name."""
+        return self.classification_label
+
+    @property
+    def reg_label(self) -> float | None:
+        """Compatibility alias for the previous field name."""
+        return self.regression_label
+
+
+@dataclass
+class BatchSchema:
+    """Padded batch with modality-specific temporal lengths."""
+
+    sample_ids: list[str]
+    text: ModalitySequence
+    audio: ModalitySequence
+    vision: ModalitySequence
+    text_representation: str
+    classification_labels: torch.Tensor | None = None
+    regression_labels: torch.Tensor | None = None
+    classification_label_mask: torch.Tensor | None = None
+    regression_label_mask: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        batch_size = len(self.sample_ids)
+        for name in MODALITIES:
+            sequence = getattr(self, name)
+            if not isinstance(sequence, ModalitySequence):
+                raise TypeError(f"{name} must be a ModalitySequence.")
+            if sequence.features.ndim != 3:
+                raise ValueError(f"{name} in BatchSchema must contain [B,T,D] features.")
+            if sequence.features.shape[0] != batch_size:
+                raise ValueError(f"{name} batch size must match sample_ids.")
+        if self.text_representation not in TEXT_REPRESENTATIONS:
+            raise ValueError(f"text_representation must be one of {TEXT_REPRESENTATIONS}.")
+
+    @property
+    def valid_masks(self) -> dict[str, torch.Tensor]:
+        return {name: getattr(self, name).valid_mask for name in MODALITIES}
+
+    @property
+    def observed_masks(self) -> dict[str, torch.Tensor]:
+        return {name: getattr(self, name).observed_mask for name in MODALITIES}
+
+    @property
+    def missing_masks(self) -> dict[str, torch.Tensor]:
+        return {name: getattr(self, name).missing_mask for name in MODALITIES}
+
+    def __getitem__(self, key: str):
+        """Minimal mapping compatibility for existing common consumers."""
+        aliases = {
+            "id": self.sample_ids,
+            "sample_ids": self.sample_ids,
+            "text": self.text.features,
+            "audio": self.audio.features,
+            "vision": self.vision.features,
+            "valid_masks": self.valid_masks,
+            "observed_masks": self.observed_masks,
+            "missing_masks": self.missing_masks,
+            "class_label": self.classification_labels,
+            "classification_labels": self.classification_labels,
+            "reg_label": self.regression_labels,
+            "regression_labels": self.regression_labels,
+            "class_label_mask": self.classification_label_mask,
+            "classification_label_mask": self.classification_label_mask,
+            "reg_label_mask": self.regression_label_mask,
+            "regression_label_mask": self.regression_label_mask,
+        }
+        try:
+            return aliases[key]
+        except KeyError as error:
+            raise KeyError(key) from error
+
+    def get(self, key: str, default=None):
+        """Dictionary-style get used by existing training code."""
+        try:
+            return self[key]
+        except KeyError:
+            return default
