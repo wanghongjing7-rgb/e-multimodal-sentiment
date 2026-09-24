@@ -1,0 +1,22 @@
+# Q2-PLAN-v0.5 exploratory trial only; none of these are optimal/frozen values.
+seed: 20260923
+epochs: 1  # Complete train split once; engineering exploration, not convergence evidence.
+batch_size: 32
+learning_rate: 0.0001
+lambda_cls: 1.0
+lambda_reg: 1.0
+clean_probability: 0.20
+shape_probs: [0.5, 0.5]  # v0.5 authorized exploratory default.
+span_count_weights: [1.0, 1.0, 1.0]  # Uniform 2/3/4, exploratory default.
+calibration:
+  epsilon: 0.20  # Explicit exploratory choice; formal value pending team decision.
+  hidden_dim: 16  # Explicit exploratory choice; formal width pending team decision.
+  beta_ratio: 0.0
+  beta_geometry: 0.01  # Explicit exploratory choice; formal value pending decision.
+geometry_normalization:
+  ratio: eligible
+  longest: eligible
+  center: eligible
+  span_count_divisor: 4.0
+  overlap: union
+# The denominator convention above is provisional, not a formal mathematical definition.
