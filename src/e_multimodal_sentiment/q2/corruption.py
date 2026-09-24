@@ -6,6 +6,7 @@ passed to a prediction model; observable proxies are extracted separately.
 
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass
 from typing import Literal, Mapping
@@ -17,6 +18,40 @@ Position = Literal["front", "middle", "rear", "random"]
 Shape = Literal["single_block", "multi_block"]
 Relation = Literal["synchronous", "staggered"]
 NAMES = {"T": "text", "A": "audio", "V": "vision"}
+TRAIN_CORRUPTION_RNG_VERSION = "Q2_TRAIN_CORRUPTION_RNG_V1"
+
+
+def training_corruption_seed(global_seed: int, epoch: int, source_sample_id: str) -> int:
+    """Derive a stable per-sample uint64 seed, independent of process/order."""
+    if epoch < 1 or not source_sample_id:
+        raise ValueError("epoch must be positive and source_sample_id nonempty")
+    payload = f"{TRAIN_CORRUPTION_RNG_VERSION}|{global_seed}|{epoch}|{source_sample_id}"
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
+
+
+def sample_training_corruption_plan(
+    *, global_seed: int, epoch: int, source_sample_id: str,
+    clean_probability: float, shape_probs: tuple[float, float],
+) -> dict[str, object]:
+    """Draw one B1/B2/B3 event using only a local versioned RNG."""
+    if not 0 <= clean_probability <= 1:
+        raise ValueError("clean_probability must be in [0,1]")
+    if len(shape_probs) != 2 or any(weight < 0 for weight in shape_probs) or sum(shape_probs) <= 0:
+        raise ValueError("shape_probs must contain two nonnegative weights with positive sum")
+    seed = training_corruption_seed(global_seed, epoch, source_sample_id)
+    rng = random.Random(seed)
+    clean = rng.random() < clean_probability
+    return {
+        "source_sample_id": source_sample_id,
+        "clean": clean,
+        "modality_set": rng.choice(("T", "A", "V", "TA", "TV", "AV", "TAV")),
+        "missing_ratio": rng.uniform(0.10, 0.50),
+        "position_type": "random",
+        "shape_type": rng.choices(("single_block", "multi_block"), weights=shape_probs)[0],
+        "overlap_type": rng.choice(("synchronous", "staggered")),
+        "seed": rng.getrandbits(64),
+        "rng_version": TRAIN_CORRUPTION_RNG_VERSION,
+    }
 
 
 @dataclass(frozen=True)

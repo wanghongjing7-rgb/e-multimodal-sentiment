@@ -8,7 +8,6 @@ import hashlib
 import json
 import math
 import os
-import random
 import subprocess
 import sys
 import time
@@ -25,7 +24,9 @@ from e_multimodal_sentiment.data.adapters import Attachment2AlignedAdapter
 from e_multimodal_sentiment.data.collate import collate_samples
 from e_multimodal_sentiment.evaluation.metrics import compute_metrics
 from e_multimodal_sentiment.models.backbones import MMSAMulTMultiTask
-from e_multimodal_sentiment.q2.corruption import corrupt_sample
+from e_multimodal_sentiment.q2.corruption import (
+    TRAIN_CORRUPTION_RNG_VERSION, corrupt_sample, sample_training_corruption_plan,
+)
 from e_multimodal_sentiment.q2.gap_proxy import GeometryNormalization
 from e_multimodal_sentiment.q2.robust_modules import CalibratedCriterion, CalibratedMMSAMulT
 from e_multimodal_sentiment.training.hooks import TaskHook
@@ -33,6 +34,7 @@ from e_multimodal_sentiment.training.losses import MultiTaskCriterion
 from e_multimodal_sentiment.training.trainer import Trainer
 
 from q2_mmsa_bootstrap import load_fixed_mmsa
+from q2_shared_init import load_shared_init
 from smoke_mmsa_mult import _mult_args
 
 
@@ -72,7 +74,8 @@ class ContinuousCorruptionHook(TaskHook):
         self.encoder = encoder.eval()
         for parameter in self.encoder.parameters():
             parameter.requires_grad_(False)
-        self.rng = random.Random(seed)
+        self.seed = seed
+        self.epoch = 0
         self.enabled = False
         self.clean_probability = clean_probability
         self.shape_probs = shape_probs
@@ -87,36 +90,36 @@ class ContinuousCorruptionHook(TaskHook):
         vision = batch["vision"].clone()
         tokens_batch = batch["text_bert"].clone()
         for index, source_id in enumerate(batch["source_sample_ids"]):
-            if self.rng.random() < self.clean_probability:
-                self.last_events.append({"source_sample_id": source_id, "clean": True})
+            plan = sample_training_corruption_plan(
+                global_seed=self.seed, epoch=self.epoch, source_sample_id=source_id,
+                clean_probability=self.clean_probability, shape_probs=self.shape_probs,
+            )
+            if plan["clean"]:
+                self.last_events.append(plan)
                 continue
             tokens = batch["text_bert"][index]
             valid = tokens[1] == 1
             masks = {name: valid for name in ("text", "audio", "vision")}
-            modality = self.rng.choice(("T", "A", "V", "TA", "TV", "AV", "TAV"))
-            ratio = self.rng.uniform(0.10, 0.50)
-            shape = self.rng.choices(("single_block", "multi_block"), weights=self.shape_probs)[0]
-            relation = self.rng.choice(("synchronous", "staggered"))
-            event_seed = self.rng.randrange(2**31)
             try:
                 event = corrupt_sample(
                     text_bert=tokens, audio=audio[index], vision=vision[index],
-                    valid_masks=masks, source_sample_id=source_id, seed=event_seed,
-                    modality_set=modality, missing_ratio=ratio, position_type="random",
-                    shape_type=shape, overlap_type=relation, span_count_weights={2: 1, 3: 1, 4: 1},
+                    valid_masks=masks, source_sample_id=source_id, seed=plan["seed"],
+                    modality_set=plan["modality_set"], missing_ratio=plan["missing_ratio"],
+                    position_type=plan["position_type"], shape_type=plan["shape_type"],
+                    overlap_type=plan["overlap_type"], span_count_weights={2: 1, 3: 1, 4: 1},
                 )
             except ValueError as error:
                 # Preserve the sample and record the infeasible planned view.
-                self.last_events.append({"source_sample_id": source_id, "clean": True,
-                                         "infeasible_corruption": str(error), "requested_shape": shape})
+                self.last_events.append({**plan, "clean": True,
+                                         "infeasible_corruption": str(error)})
                 continue
             audio[index] = event.observation["audio"]
             vision[index] = event.observation["vision"]
             tokens_batch[index] = event.observation["text"]
-            if "T" in modality:
+            if "T" in plan["modality_set"]:
                 with torch.no_grad():
                     text[index] = self.encoder(event.observation["text"].unsqueeze(0).float())[0]
-            self.last_events.append({**event.metadata, "clean": False})
+            self.last_events.append({**plan, **event.metadata, "clean": False})
         batch["text"], batch["audio"], batch["vision"] = text, audio, vision
         batch["text_bert"] = tokens_batch
         return batch
@@ -198,14 +201,16 @@ def main() -> None:
     parser.add_argument("--geometry-span-divisor", type=float)
     parser.add_argument("--geometry-overlap-den", choices=("union", "eligible"))
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.lr <= 0:
-        parser.error("epochs, batch-size and lr must be positive")
+    if args.epochs != 2 or args.batch_size < 1 or args.lr <= 0:
+        parser.error("equal-budget runs require exactly 2 epochs, positive batch-size and lr")
+    if args.init_checkpoint is None or not args.init_checkpoint.is_file():
+        parser.error("all B0/B1/B2/B3 runs require an existing shared_init.pt")
     if args.output_dir.exists():
         parser.error("output directory already exists; training never overwrites prior experiments")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA requested but unavailable")
     if args.model in ("B2", "B3") and any(value is None for value in (
-        args.init_checkpoint, args.epsilon, args.beta, args.hidden_dim,
+        args.epsilon, args.beta, args.hidden_dim,
         args.geometry_ratio_den, args.geometry_longest_den, args.geometry_center_den,
         args.geometry_span_divisor, args.geometry_overlap_den,
     )):
@@ -213,19 +218,20 @@ def main() -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     torch.manual_seed(args.seed)
-    random.seed(args.seed)
     torch.set_num_threads(min(torch.get_num_threads(), 4))
     device = torch.device(args.device)
     args.output_dir.mkdir(parents=True)
     source_paths = [
         ROOT / "scripts" / "q2_train_baselines.py",
         ROOT / "scripts" / "q2_mmsa_bootstrap.py",
+        ROOT / "scripts" / "q2_shared_init.py",
         ROOT / "src" / "e_multimodal_sentiment" / "q2" / "corruption.py",
         ROOT / "src" / "e_multimodal_sentiment" / "q2" / "gap_proxy.py",
         ROOT / "src" / "e_multimodal_sentiment" / "q2" / "robust_modules.py",
         ROOT / "configs" / "q2_cgrc_exploratory.yaml",
     ]
     config = vars(args).copy()
+    init_sha256 = hashlib.sha256(args.init_checkpoint.read_bytes()).hexdigest()
     config.update(code_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                   torch=torch.__version__, cuda=torch.version.cuda, device=str(device),
                   data_version="Attachment2 aligned_50.pkl; train/valid only",
@@ -234,7 +240,13 @@ def main() -> None:
                   end_time=None,
                   source_sha256={str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                                  for path in source_paths if path.exists()},
-                  status="running")
+                  status="running", shared_init_sha256=init_sha256,
+                  corruption_rng_version=TRAIN_CORRUPTION_RNG_VERSION,
+                  geometry_span_divisor_status="deprecated; inactive",
+                  batch_ordering="independent torch.Generator(seed), shuffle=True, num_workers=0",
+                  optimizer="Adam", scheduler=None, gradient_clipping=None,
+                  checkpoint_rule="best validation total_loss; also save last",
+                  optimizer_steps=0, train_sample_count=0, epochs_completed=0)
     (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
     mult_cls, encoder_cls = load_fixed_mmsa(args.mmsa_root)
     adapter = Attachment2AlignedAdapter(args.data_path, trusted=True)
@@ -249,9 +261,10 @@ def main() -> None:
                               shuffle=False, collate_fn=collate_pairs)
     base = mult_cls(_mult_args(args.mmsa_root))
     model = MMSAMulTMultiTask(base)
+    shared_metadata = load_shared_init(args.init_checkpoint, model, expected_sha256=init_sha256)
+    if shared_metadata["source_commit"] != config["code_commit"]:
+        raise ValueError("shared_init source commit differs from current training source")
     if args.model in ("B2", "B3"):
-        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(initial["model"])
         model = CalibratedMMSAMulT(
             model, mode="ratio" if args.model == "B2" else "geometry",
             epsilon=args.epsilon, hidden_dim=args.hidden_dim,
@@ -268,14 +281,23 @@ def main() -> None:
     hook = ContinuousCorruptionHook(encoder_cls(use_finetune=False).to(device), args.seed,
                                     args.clean_probability, tuple(args.shape_probs)) if args.model in ("B1", "B2", "B3") else TaskHook()
     trainer = Trainer(model, optimizer, criterion, device=str(device), hook=hook, forward_fn=forward_multitask)
+    # Constructors differ by variant; align the subsequent model/dropout stream.
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     best = math.inf
+    optimizer_steps = 0
+    train_sample_count = 0
     with (args.output_dir / "train_batches.jsonl").open("w", encoding="utf-8") as log:
         for epoch in range(1, args.epochs + 1):
             start = time.perf_counter()
             if isinstance(hook, ContinuousCorruptionHook):
+                hook.epoch = epoch
                 hook.enabled = True
             for number, batch in enumerate(train_loader, 1):
                 losses = trainer.train_step(batch)
+                optimizer_steps += 1
+                train_sample_count += len(batch["source_sample_ids"])
                 row = {"epoch": epoch, "batch": number, "source_sample_ids": batch["source_sample_ids"],
                        "losses": losses, "corruption_events": hook.last_events if isinstance(hook, ContinuousCorruptionHook) else []}
                 log.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -286,10 +308,15 @@ def main() -> None:
                 hook.enabled = False
             valid_metrics = validate(trainer.model, criterion, valid_loader, device,
                                      args.output_dir / f"valid_predictions_epoch_{epoch}.csv")
-            epoch_result = {"epoch": epoch, "train_batches": len(train_loader), "valid": valid_metrics,
+            epoch_result = {"epoch": epoch, "train_batches": len(train_loader),
+                            "optimizer_steps": optimizer_steps,
+                            "train_sample_count": train_sample_count,
+                            "epochs_completed": epoch, "valid": valid_metrics,
                             "elapsed_seconds": time.perf_counter() - start}
             with (args.output_dir / "epochs.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(epoch_result, allow_nan=True) + "\n")
+            config.update(optimizer_steps=optimizer_steps, train_sample_count=train_sample_count,
+                          epochs_completed=epoch)
             state = {"model": trainer.model.state_dict(), "optimizer": optimizer.state_dict(),
                      "epoch": epoch, "seed": args.seed, "config": config, "valid": valid_metrics}
             torch.save(state, args.output_dir / "last.pt")
@@ -297,6 +324,7 @@ def main() -> None:
                 best = valid_metrics["total_loss"]
                 torch.save(state, args.output_dir / "best_val_total_loss.pt")
             print(json.dumps(epoch_result, allow_nan=True), flush=True)
+            (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
     config["status"] = "completed"
     config["end_time"] = datetime.now().astimezone().isoformat()
     (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
