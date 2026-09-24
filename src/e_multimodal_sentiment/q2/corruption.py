@@ -54,6 +54,22 @@ def sample_training_corruption_plan(
     }
 
 
+def mask_aligned_dense_text(text: torch.Tensor, spans: list[list[int]]) -> torch.Tensor:
+    """Zero the same aligned text intervals in existing dense Attachment2 features.
+
+    This avoids any pretrained text encoder during exploratory valid experiments.
+    It does not synthesize dense features from text_bert-only test inputs.
+    """
+    if text.ndim != 2:
+        raise ValueError("dense text must have shape [T,D]")
+    result = text.clone()
+    for start, stop in spans:
+        if not 0 <= start < stop <= text.shape[0]:
+            raise ValueError("dense text span is outside aligned time axis")
+        result[start:stop] = 0
+    return result
+
+
 @dataclass(frozen=True)
 class CorruptionResult:
     """Non-mutating corrupted view, simulation truth and event metadata."""

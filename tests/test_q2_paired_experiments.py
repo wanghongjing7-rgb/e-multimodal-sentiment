@@ -14,7 +14,8 @@ import torch
 
 from e_multimodal_sentiment.models.backbones.mmsa_multitask import MMSAMulTMultiTask
 from e_multimodal_sentiment.q2.corruption import (
-    TRAIN_CORRUPTION_RNG_VERSION, corrupt_sample, sample_training_corruption_plan,
+    TRAIN_CORRUPTION_RNG_VERSION, corrupt_sample, mask_aligned_dense_text,
+    sample_training_corruption_plan,
     training_corruption_seed,
 )
 from e_multimodal_sentiment.q2.gap_proxy import GeometryNormalization
@@ -92,6 +93,15 @@ def test_full_corruption_metadata_matches_for_three_variants() -> None:
     assert events[0] == events[1] == events[2]
     assert random.getstate() == python_state
     assert torch.equal(torch.random.get_rng_state(), torch_state)
+
+
+def test_dense_text_uses_exact_simulated_aligned_intervals_without_mutation() -> None:
+    dense = torch.ones(20, 8)
+    masked = mask_aligned_dense_text(dense, [[2, 5], [9, 11]])
+    assert torch.equal(masked[2:5], torch.zeros(3, 8))
+    assert torch.equal(masked[9:11], torch.zeros(2, 8))
+    assert torch.equal(masked[5:9], dense[5:9])
+    assert bool(dense.all())
 
 
 def test_shared_base_state_and_four_clean_outputs_match(tmp_path: Path) -> None:

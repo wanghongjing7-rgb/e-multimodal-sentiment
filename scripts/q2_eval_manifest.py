@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from e_multimodal_sentiment.evaluation.metrics import compute_metrics
 from e_multimodal_sentiment.models.backbones import MMSAMulTMultiTask
+from e_multimodal_sentiment.q2.corruption import mask_aligned_dense_text
 from e_multimodal_sentiment.q2.gap_proxy import GeometryNormalization
 from e_multimodal_sentiment.q2.robust_modules import CalibratedMMSAMulT
 
@@ -53,7 +54,7 @@ def main() -> None:
         raise ValueError(f"Scenario {args.scenario_id} absent from manifest")
     with args.data_path.open("rb") as stream:
         valid = pickle.load(stream)["valid"]
-    mult_cls, encoder_cls = load_fixed_mmsa(args.mmsa_root)
+    mult_cls, _ = load_fixed_mmsa(args.mmsa_root)
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     config = state["config"]
     model = MMSAMulTMultiTask(mult_cls(_mult_args(args.mmsa_root)))
@@ -70,9 +71,6 @@ def main() -> None:
     model = model.to(device)
     model.load_state_dict(state["model"])
     model.eval()
-    encoder = encoder_cls(use_finetune=False).to(device).eval() if any(
-        row["status"] == "ready" and row["span_list"]["text"] for row in rows
-    ) else None
     args.output_dir.mkdir(parents=True)
     logits, classes, predicted, targets = [], [], [], []
     alpha_rows: list[list[float]] = []
@@ -102,7 +100,7 @@ def main() -> None:
                 if spans["text"]:
                     for start, stop in spans["text"]:
                         tokens[0, start:stop] = 100
-                    text = encoder(tokens.unsqueeze(0))[0]
+                    text = mask_aligned_dense_text(text, spans["text"])
                 if isinstance(model, CalibratedMMSAMulT):
                     structural = (tokens[1] == 1).unsqueeze(0)
                     output = model(

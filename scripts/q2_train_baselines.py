@@ -25,7 +25,8 @@ from e_multimodal_sentiment.data.collate import collate_samples
 from e_multimodal_sentiment.evaluation.metrics import compute_metrics
 from e_multimodal_sentiment.models.backbones import MMSAMulTMultiTask
 from e_multimodal_sentiment.q2.corruption import (
-    TRAIN_CORRUPTION_RNG_VERSION, corrupt_sample, sample_training_corruption_plan,
+    TRAIN_CORRUPTION_RNG_VERSION, corrupt_sample, mask_aligned_dense_text,
+    sample_training_corruption_plan,
 )
 from e_multimodal_sentiment.q2.gap_proxy import GeometryNormalization
 from e_multimodal_sentiment.q2.robust_modules import CalibratedCriterion, CalibratedMMSAMulT
@@ -68,12 +69,9 @@ def collate_pairs(items):
 
 
 class ContinuousCorruptionHook(TaskHook):
-    """B1-only batch preprocessing; the model receives no simulation truth."""
+    """Deterministic aligned dense-feature corruption; no pretrained encoder."""
 
-    def __init__(self, encoder, seed: int, clean_probability: float, shape_probs: tuple[float, float]):
-        self.encoder = encoder.eval()
-        for parameter in self.encoder.parameters():
-            parameter.requires_grad_(False)
+    def __init__(self, seed: int, clean_probability: float, shape_probs: tuple[float, float]):
         self.seed = seed
         self.epoch = 0
         self.enabled = False
@@ -117,8 +115,7 @@ class ContinuousCorruptionHook(TaskHook):
             vision[index] = event.observation["vision"]
             tokens_batch[index] = event.observation["text"]
             if "T" in plan["modality_set"]:
-                with torch.no_grad():
-                    text[index] = self.encoder(event.observation["text"].unsqueeze(0).float())[0]
+                text[index] = mask_aligned_dense_text(text[index], event.metadata["span_list"]["text"])
             self.last_events.append({**plan, **event.metadata, "clean": False})
         batch["text"], batch["audio"], batch["vision"] = text, audio, vision
         batch["text_bert"] = tokens_batch
@@ -242,13 +239,14 @@ def main() -> None:
                                  for path in source_paths if path.exists()},
                   status="running", shared_init_sha256=init_sha256,
                   corruption_rng_version=TRAIN_CORRUPTION_RNG_VERSION,
+                  text_corruption="zero aligned Attachment2 dense text spans; text_bert token 100 only for observable proxy",
                   geometry_span_divisor_status="deprecated; inactive",
                   batch_ordering="independent torch.Generator(seed), shuffle=True, num_workers=0",
                   optimizer="Adam", scheduler=None, gradient_clipping=None,
                   checkpoint_rule="best validation total_loss; also save last",
                   optimizer_steps=0, train_sample_count=0, epochs_completed=0)
     (args.output_dir / "config.json").write_text(json.dumps(config, default=str, indent=2), encoding="utf-8")
-    mult_cls, encoder_cls = load_fixed_mmsa(args.mmsa_root)
+    mult_cls, _ = load_fixed_mmsa(args.mmsa_root)
     adapter = Attachment2AlignedAdapter(args.data_path, trusted=True)
     train = adapter.to_samples("train")
     valid = adapter.to_samples("valid")
@@ -278,8 +276,8 @@ def main() -> None:
     criterion = (CalibratedCriterion(lambda_cls=args.lambda_cls, lambda_reg=args.lambda_reg,
                                      beta=args.beta) if args.model in ("B2", "B3")
                  else MultiTaskCriterion(args.lambda_cls, args.lambda_reg))
-    hook = ContinuousCorruptionHook(encoder_cls(use_finetune=False).to(device), args.seed,
-                                    args.clean_probability, tuple(args.shape_probs)) if args.model in ("B1", "B2", "B3") else TaskHook()
+    hook = ContinuousCorruptionHook(args.seed, args.clean_probability,
+                                    tuple(args.shape_probs)) if args.model in ("B1", "B2", "B3") else TaskHook()
     trainer = Trainer(model, optimizer, criterion, device=str(device), hook=hook, forward_fn=forward_multitask)
     # Constructors differ by variant; align the subsequent model/dropout stream.
     torch.manual_seed(args.seed)
