@@ -141,6 +141,35 @@ def test_geometry_distinguishes_span_count_and_longest_and_is_finite() -> None:
     assert descriptions[0][3] < descriptions[1][3]  # number of spans
 
 
+def test_span_count_uses_feasible_eligible_axis_not_simulator_cap() -> None:
+    """A fixed four-span divisor would give identical values to these axes."""
+    valid = {name: torch.zeros(20, dtype=torch.bool) for name in ("text", "audio", "vision")}
+    proxy = {name: torch.zeros(20, dtype=torch.bool) for name in valid}
+    valid["text"][:8] = True
+    valid["audio"][:16] = True
+    proxy["text"][1:3] = True
+    proxy["audio"][1:3] = True
+    geometry = observable_gap_geometry(proxy, valid, normalization())
+    assert geometry[3].item() == pytest.approx(1 / 4)
+    assert geometry[8].item() == pytest.approx(1 / 8)
+    assert geometry[13].item() == 0.0  # no eligible vision steps, no gap
+    assert torch.isfinite(geometry).all()
+
+
+def test_sync_and_staggered_have_reproducible_distinct_overlap() -> None:
+    synchronous = corrupt(modality_set="TA", missing_ratio=0.25,
+                          position_type="front", overlap_type="synchronous")
+    staggered = corrupt(modality_set="TA", missing_ratio=0.25,
+                        position_type="front", overlap_type="staggered")
+    def intersection(event):
+        return int((event.true_simulated_missing_mask["text"] &
+                    event.true_simulated_missing_mask["audio"]).sum())
+    assert intersection(synchronous) > intersection(staggered)
+    assert synchronous.metadata["span_list"] == corrupt(
+        modality_set="TA", missing_ratio=0.25, position_type="front",
+        overlap_type="synchronous").metadata["span_list"]
+
+
 def test_pair_overlap_and_no_gap_are_finite() -> None:
     valid = fixture_observation()[3]
     clean = corrupt(missing_ratio=0)

@@ -12,7 +12,11 @@ MODALITIES = ("text", "audio", "vision")
 
 @dataclass(frozen=True)
 class GeometryNormalization:
-    """Exploratory normalization; callers must choose and record a convention."""
+    """Exploratory normalization; callers must choose and record a convention.
+
+    ``span_count_divisor`` is retained for existing runner/checkpoint arguments.
+    It no longer determines k: k uses the eligible axis's feasible span count.
+    """
 
     ratio: Literal["eligible", "sequence"]
     longest: Literal["eligible", "sequence"]
@@ -71,7 +75,12 @@ def observable_gap_geometry(
     eligible_masks: Mapping[str, torch.Tensor],
     normalization: GeometryNormalization,
 ) -> torch.Tensor:
-    """Build [r,l,c,k,b] x 3 plus pair overlaps from observable proxies."""
+    """Build [r,l,c,k,b] x 3 plus pair overlaps from observable proxies.
+
+    k = K / K_max, where K_max is the maximum number of disjoint one-step
+    spans on the eligible axis (sum of ceil(run_length / 2) over eligible runs).
+    This is observable at inference and does not use the simulator's 2-4 cap.
+    """
     if set(proxy) != set(MODALITIES) or set(eligible_masks) != set(MODALITIES):
         raise ValueError("proxy and eligible_masks must contain all three modalities.")
     values: list[float] = []
@@ -82,6 +91,7 @@ def observable_gap_geometry(
         eligible_count = int(eligible.sum())
         count = int(observed.sum())
         lengths = _span_lengths(observed)
+        max_separated_spans = sum((length + 1) // 2 for length in _span_lengths(eligible))
         ratio_den = eligible_count if normalization.ratio == "eligible" else n
         longest_den = eligible_count if normalization.longest == "eligible" else n
         if normalization.center == "eligible":
@@ -96,7 +106,7 @@ def observable_gap_geometry(
             count / max(ratio_den, 1),
             max(lengths, default=0) / max(longest_den, 1),
             center,
-            len(lengths) / normalization.span_count_divisor,
+            len(lengths) / max(max_separated_spans, 1),
             float(count > 0),
         ])
     for left, right in (("text", "audio"), ("text", "vision"), ("audio", "vision")):
